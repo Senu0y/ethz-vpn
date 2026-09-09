@@ -252,6 +252,33 @@ openconnect_running() {
 	pgrep -x openconnect >/dev/null 2>&1
 }
 
+vpn_server_host_route_exists() {
+	local ip
+	while IFS= read -r ip; do
+		[[ -n "$ip" ]] || continue
+		if /usr/sbin/netstat -rn -f inet 2>/dev/null \
+			| awk -v target="$ip" '$1 == target || $1 == target "/32" { found = 1 } END { exit !found }'; then
+			return 0
+		fi
+	done < <(/usr/bin/dscacheutil -q host -a name "$VPN_HOST" 2>/dev/null \
+		| awk '/^ip_address: / { print $2 }')
+	return 1
+}
+
+cleanup_orphaned_vpn_host_route() {
+	# OpenConnect owns this route while connected. Never remove it from a live
+	# session; without OpenConnect, an exact host route to its server is stale.
+	openconnect_running && return 0
+	vpn_server_host_route_exists || return 0
+
+	warn "Removing stale route to ${VPN_HOST} left by an earlier VPN session..."
+	if ! sudo -n /sbin/route -n delete -host "$VPN_HOST" >/dev/null 2>&1; then
+		# Older installations do not yet have the narrow route command in sudoers.
+		# Fall back to an interactive sudo prompt in the terminal.
+		sudo /sbin/route -n delete -host "$VPN_HOST" >/dev/null
+	fi
+}
+
 show_vpn_ip() {
 	local iface ip
 	for iface in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun'); do
@@ -292,6 +319,7 @@ connect() {
 		error 'Error: openconnect already running. Use "ethz-vpn disconnect" first.'
 		return 1
 	fi
+	cleanup_orphaned_vpn_host_route
 
 	local display
 	display=$(profile_get_field "$id" "displayName")
@@ -329,6 +357,7 @@ disconnect() {
 			warn 'Warning: openconnect still running after SIGINT.'
 			notify "ETHZ VPN" "Disconnect may have failed — process still running"
 		else
+			cleanup_orphaned_vpn_host_route
 			success 'VPN disconnected successfully.'
 			log_event "VPN disconnected successfully"
 			notify "ETHZ VPN" "Disconnected"

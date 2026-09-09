@@ -25,6 +25,10 @@ final class VPNController {
     private(set) var state: VPNState = .disconnected
     private var statusTimer: Timer?
     private var openconnectProcess: Process?
+    private let physicalNetworkMonitor = PhysicalNetworkMonitor()
+    private var networkAtConnection: PhysicalNetworkSnapshot?
+    private var pendingReconnectProfileID: String?
+    private var staleRouteRecoveryAttempted = false
     var onStateChange: ((VPNState) -> Void)?
 
     private init() {
@@ -33,11 +37,19 @@ final class VPNController {
             state = .connected(ip: vpnIP() ?? "")
         }
         startPolling()
+        physicalNetworkMonitor.start { [weak self] snapshot in
+            self?.physicalNetworkDidChange(to: snapshot)
+        }
     }
 
     // MARK: - Public API
 
     func connect(profile: VPNProfile? = nil) {
+        staleRouteRecoveryAttempted = false
+        startConnection(profile: profile)
+    }
+
+    private func startConnection(profile: VPNProfile? = nil) {
         // Gate on our state machine, not pgrep — avoids a race where the
         // sudo/openconnect process is still dying but pgrep still finds it.
         guard case .disconnected = state else { return }
@@ -66,6 +78,8 @@ final class VPNController {
         let fullUrl = subnet.isEmpty ? baseUrl : "\(baseUrl)/\(subnet)"
 
         store.activeProfileID = target.id
+        networkAtConnection = physicalNetworkMonitor.currentSnapshot
+            ?? PhysicalNetworkSnapshot.capture()
         setState(.connecting)
 
         let openconnectPath = bundledOpenconnectPath()
@@ -115,6 +129,16 @@ final class VPNController {
                 self.openconnectProcess = nil
                 self.setState(.disconnected)
                 if proc.terminationStatus != 0 {
+                    if self.isStaleRouteFailure(errText),
+                       !self.staleRouteRecoveryAttempted {
+                        self.staleRouteRecoveryAttempted = true
+                        self.removeOrphanedVPNHostRoute()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+                            guard case .disconnected = self?.state else { return }
+                            self?.startConnection(profile: target)
+                        }
+                        return
+                    }
                     let detail = errText
                         .components(separatedBy: .newlines)
                         .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
@@ -148,15 +172,27 @@ final class VPNController {
     }
 
     func disconnect() {
-        guard isOpenconnectRunning() else { return }
+        pendingReconnectProfileID = nil
+        beginDisconnect()
+    }
+
+    private func beginDisconnect() {
         setState(.disconnecting)
+        guard isOpenconnectRunning() else {
+            finishDisconnect(needsRouteCleanup: pendingReconnectProfileID != nil)
+            return
+        }
         openconnectProcess = nil  // disown so any pending terminationHandler is a no-op
         shell("/usr/bin/sudo", ["/usr/bin/pkill", "-SIGINT", "-x", "openconnect"])
-        // Force-kill fallback: if still running after 6s, send SIGKILL
+        // Escalate gradually. Any forced stop is followed by route cleanup.
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
             guard case .disconnecting = self?.state else { return }
-            _ = self?.shell("/usr/bin/sudo", ["/usr/bin/pkill", "-SIGKILL", "-x", "openconnect"])
-            self?.setState(.disconnected)
+            _ = self?.shell("/usr/bin/sudo", ["/usr/bin/pkill", "-SIGTERM", "-x", "openconnect"])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard case .disconnecting = self?.state else { return }
+                _ = self?.shell("/usr/bin/sudo", ["/usr/bin/pkill", "-SIGKILL", "-x", "openconnect"])
+                self?.finishDisconnect(needsRouteCleanup: true)
+            }
         }
     }
 
@@ -181,7 +217,7 @@ final class VPNController {
                 }
             case .disconnecting:
                 if !running {
-                    self.setState(.disconnected)
+                    self.finishDisconnect(needsRouteCleanup: self.pendingReconnectProfileID != nil)
                 }
             case .connected:
                 if !running {
@@ -202,6 +238,63 @@ final class VPNController {
     }
 
     // MARK: - Helpers
+
+    private func physicalNetworkDidChange(to snapshot: PhysicalNetworkSnapshot?) {
+        guard let snapshot else { return }
+
+        if networkAtConnection == nil {
+            networkAtConnection = snapshot
+            return
+        }
+
+        guard snapshot != networkAtConnection else { return }
+        networkAtConnection = snapshot
+
+        switch state {
+        case .connected, .connecting:
+            pendingReconnectProfileID = ProfileStore.shared.activeProfile?.id
+            postNotification(body: "Network changed. Reconnecting VPN...")
+            beginDisconnect()
+        case .disconnected:
+            attemptPendingReconnect()
+        case .disconnecting:
+            break
+        }
+    }
+
+    private func finishDisconnect(needsRouteCleanup: Bool) {
+        guard case .disconnecting = state else { return }
+        if needsRouteCleanup {
+            removeOrphanedVPNHostRoute()
+        }
+        setState(.disconnected)
+        attemptPendingReconnect()
+    }
+
+    private func attemptPendingReconnect() {
+        guard case .disconnected = state,
+              physicalNetworkMonitor.currentSnapshot != nil,
+              let id = pendingReconnectProfileID,
+              let profile = ProfileStore.shared.profiles.first(where: { $0.id == id })
+        else { return }
+
+        pendingReconnectProfileID = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            guard case .disconnected = self?.state else { return }
+            self?.connect(profile: profile)
+        }
+    }
+
+    private func isStaleRouteFailure(_ errorText: String) -> Bool {
+        errorText.localizedCaseInsensitiveContains("Can't assign requested address")
+            || errorText.localizedCaseInsensitiveContains("Cannot assign requested address")
+    }
+
+    @discardableResult
+    private func removeOrphanedVPNHostRoute() -> Bool {
+        guard !isOpenconnectRunning() else { return false }
+        return shell("/usr/bin/sudo", ["-n", "/sbin/route", "-n", "delete", "-host", "sslvpn.ethz.ch"]) == 0
+    }
 
     private func setState(_ newState: VPNState) {
         state = newState
