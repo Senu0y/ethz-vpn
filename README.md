@@ -19,6 +19,8 @@ Menu bar app and CLI for connecting to the ETH Zurich VPN using openconnect with
 
 Both share the same Keychain entries and profile store, so setup done in the app works in the shell and vice versa.
 
+If the underlying Wi-Fi network changes while the VPN is active, the menu bar app automatically restarts OpenConnect on the new network. Both the app and CLI also remove an orphaned server host route before reconnecting, preventing the macOS `Can't assign requested address` failure caused by a route tied to the previous WLAN.
+
 ---
 
 ## Quick start (end user)
@@ -137,7 +139,7 @@ The CLI requires `openconnect` and `sudo` in PATH, and a sudoers rule for passwo
 | Profile list | `~/.local/share/ethz-vpn-connect/profiles.json` |
 | Active profile ID | `UserDefaults` (`com.apple.ETHVPNMenuBar`) |
 
-The sudoers rule is written to `/etc/sudoers.d/ethz-vpn` and allows the current user to run openconnect and `pkill` without a password.
+The sudoers rule is written to `/etc/sudoers.d/ethz-vpn` and allows the current user to run openconnect, `pkill`, and one narrowly scoped route-cleanup command for `sslvpn.ethz.ch` without a password. The route cleanup lets the app recover if switching Wi-Fi networks leaves OpenConnect's server route attached to the old network.
 
 ---
 

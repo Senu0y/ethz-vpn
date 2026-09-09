@@ -1,11 +1,13 @@
 import Foundation
 
 enum SudoersHelper {
+    private static let staleRouteCommand = "/sbin/route -n delete -host sslvpn.ethz.ch"
+
     static func isInstalled(openconnectPath: String) -> Bool {
         guard let contents = try? String(contentsOfFile: "/etc/sudoers.d/ethz-vpn", encoding: .utf8) else { return false }
         let realPath = URL(fileURLWithPath: openconnectPath).resolvingSymlinksInPath().path
         let escapedPath = realPath.replacingOccurrences(of: " ", with: #"\ "#)
-        return contents.contains(escapedPath)
+        return contents.contains(escapedPath) && contents.contains(staleRouteCommand)
     }
 
     static func installIfNeeded(openconnectPath: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -14,7 +16,12 @@ enum SudoersHelper {
         let user = NSUserName()
         let realPath = URL(fileURLWithPath: openconnectPath).resolvingSymlinksInPath().path
         let escapedPath = realPath.replacingOccurrences(of: " ", with: #"\ "#)
-        let rule = "\(user) ALL=(ALL) NOPASSWD: \(escapedPath)\n\(user) ALL=(ALL) NOPASSWD: /usr/bin/pkill\n"
+        let rule = """
+        \(user) ALL=(ALL) NOPASSWD: \(escapedPath)
+        \(user) ALL=(ALL) NOPASSWD: /usr/bin/pkill
+        \(user) ALL=(ALL) NOPASSWD: \(staleRouteCommand)
+
+        """
 
         // Write rule to a temp file from Swift (avoids shell quoting issues with special chars)
         let tmpPath = "/tmp/ethz-vpn-sudoers.tmp"
