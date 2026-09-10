@@ -2,6 +2,7 @@
 set -eu
 umask 077
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+route_record=${ETHZ_VPN_ROUTE_RECORD:?}
 # Do not claim a host route that existed before this session configured networking.
 if [ "$reason" = connect ]; then
     if /sbin/route -n get "$VPNGATEWAY" > "$ETHZ_VPN_SESSION_DIR/route.before" 2>/dev/null; then
@@ -10,13 +11,41 @@ if [ "$reason" = connect ]; then
         fi
     fi
 fi
-"$script_dir/vpnc-script"
+diagnostic="$ETHZ_VPN_SESSION_DIR/vpnc-script.stderr.pipe"
+/usr/bin/mkfifo "$diagnostic"
+(
+    category=network-script-failed
+    while IFS= read -r line; do
+        case "$line" in
+            *"Can't assign requested address"*|*"Cannot assign requested address"*) category=address-not-available ;;
+            *"Network is unreachable"*|*"network is unreachable"*|*"No route to host"*|*"no route to host"*) category=network-unreachable ;;
+            *"File exists"*|*"file exists"*|*"route already exists"*) category=route-already-exists ;;
+            *"Operation not permitted"*|*"operation not permitted"*|*"Permission denied"*|*"permission denied"*) category=permission-denied ;;
+        esac
+    done
+    printf '%s\n' "$category" > "$ETHZ_VPN_SESSION_DIR/network-error"
+) < "$diagnostic" &
+classifier_pid=$!
+if "$script_dir/vpnc-script" 2>"$diagnostic"; then
+    status=0
+else
+    status=$?
+fi
+wait "$classifier_pid" || true
+/bin/rm -f "$diagnostic"
+if [ "$status" -ne 0 ]; then
+    exit "$status"
+fi
+/bin/rm -f "$ETHZ_VPN_SESSION_DIR/network-error"
 case "$reason" in
     connect|reconnect)
         /bin/rm -f "$ETHZ_VPN_SESSION_DIR/token.conf"
         if [ -f "$ETHZ_VPN_SESSION_DIR/owns-route" ]; then
             /sbin/route -n get "$VPNGATEWAY" > "$ETHZ_VPN_SESSION_DIR/route.tmp" 2>/dev/null || true
-            /bin/mv -f "$ETHZ_VPN_SESSION_DIR/route.tmp" "$ETHZ_VPN_SESSION_DIR/route"
+            if [ -s "$ETHZ_VPN_SESSION_DIR/route.tmp" ]; then
+                /bin/cp "$ETHZ_VPN_SESSION_DIR/route.tmp" "$ETHZ_VPN_SESSION_DIR/route"
+                /bin/mv -f "$ETHZ_VPN_SESSION_DIR/route.tmp" "$route_record"
+            fi
         fi
         printf '%s\n' "${INTERNAL_IP4_ADDRESS:-${INTERNAL_IP6_ADDRESS:-}}" > "$ETHZ_VPN_SESSION_DIR/ip.tmp"
         /bin/mv -f "$ETHZ_VPN_SESSION_DIR/ip.tmp" "$ETHZ_VPN_SESSION_DIR/ip"

@@ -192,6 +192,37 @@ To select a particular profile, append its saved name to `ethz-vpn connect`.
 | Installer says the helper is running | Disconnect, disable VPN Access, and quit before retrying installation. |
 | Two ETHZ VPN apps appear | An old copy may remain in `~/Applications`. Launch the new one from `/Applications/ETHZ VPN.app`; the installer does not remove the old copy. |
 
+### Diagnostic logs
+
+The app and privileged helper write privacy-safe lifecycle and route-cleanup events to the macOS unified log. There is no ordinary ETHZ VPN `.log` file. macOS manages the underlying log store internally under `/var/db/diagnostics`; use the `log` command or Console.app instead of reading files there directly.
+
+The logs do not contain usernames, realms, passwords, OTP secrets, cookies, raw OpenConnect output, or internal VPN addresses. They contain connection-state changes, helper startup and communication failures, OpenConnect exit statuses, safe network-error categories, physical-network changes, and route-cleanup decisions.
+
+To watch a connection attempt live:
+
+```bash
+log stream --style compact --level info \
+  --predicate 'subsystem == "com.dcamenisch.ethz-vpn-menubar" OR subsystem == "com.dcamenisch.ethz-vpn-menubar.helper"'
+```
+
+To inspect recent events after a failure:
+
+```bash
+log show --last 1h --style compact \
+  --predicate 'subsystem == "com.dcamenisch.ethz-vpn-menubar" OR subsystem == "com.dcamenisch.ethz-vpn-menubar.helper"'
+```
+
+If privileged-helper messages do not appear, stream at debug level with administrator access:
+
+```bash
+sudo log stream --style compact --level debug \
+  --predicate 'subsystem == "com.dcamenisch.ethz-vpn-menubar" OR subsystem == "com.dcamenisch.ethz-vpn-menubar.helper"'
+```
+
+For a graphical view, open `/System/Applications/Utilities/Console.app`, select the Mac under **Devices**, click **Start streaming**, and search for `com.dcamenisch.ethz-vpn-menubar`.
+
+The helper keeps a root-only ownership record for the exact VPN-server host route it creates. If cleanup is interrupted, the next connection removes that recorded route only when its destination, gateway, and interface still match; routes changed or installed by another tool are left untouched.
+
 ## Build targets and distribution
 
 For compilation and nonprivileged checks without installation:

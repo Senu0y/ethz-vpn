@@ -3,6 +3,9 @@ import VPNShared
 import SystemConfiguration
 import AppKit
 import UserNotifications
+import OSLog
+
+private let vpnLog = Logger(subsystem: VPNService.appID, category: "connection")
 
 enum VPNState {
     case connected(ip: String)
@@ -53,6 +56,7 @@ final class VPNController {
             return
         }
         store.activeProfileID = target.id
+        vpnLog.notice("User requested VPN connection")
         connectionProfile = target
         networkSnapshot = physicalNetworkSnapshot()
         revision += 1
@@ -64,6 +68,7 @@ final class VPNController {
         }) { (result: Result<String?, Error>) in
             self.requestPending = false
             if let error = self.errorMessage(result) {
+                vpnLog.error("VPN connection request failed: \(error, privacy: .public)")
                 self.setState(.disconnected)
                 self.postNotification(body: error)
             }
@@ -80,6 +85,7 @@ final class VPNController {
     }
 
     func disconnect() {
+        vpnLog.notice("User requested VPN disconnect")
         reconnectProfile = nil
         stopSession()
     }
@@ -131,6 +137,7 @@ final class VPNController {
                 } else if status.0 == "connected" || status.0 == "connecting", let profile = self.connectionProfile {
                     let current = self.physicalNetworkSnapshot()
                     if let previous = self.networkSnapshot, let current, current != previous {
+                        vpnLog.notice("Physical network changed; restarting VPN connection")
                         self.networkSnapshot = current
                         self.reconnectProfile = profile
                         self.stopSession()
@@ -138,6 +145,7 @@ final class VPNController {
                     if self.networkSnapshot == nil { self.networkSnapshot = current }
                 }
             case .failure(let error):
+                vpnLog.error("VPN status request failed: \(error.localizedDescription, privacy: .public)")
                 self.setState(.disconnected)
                 if error.localizedDescription != self.lastReportedError {
                     self.lastReportedError = error.localizedDescription
@@ -169,7 +177,11 @@ final class VPNController {
     }
 
     private func setState(_ newState: VPNState) {
+        let previous = state.logName
         state = newState
+        if previous != newState.logName {
+            vpnLog.notice("VPN state changed: \(previous, privacy: .public) -> \(newState.logName, privacy: .public)")
+        }
         onStateChange?(newState)
     }
 
@@ -180,6 +192,17 @@ final class VPNController {
         content.title = AppConstants.appName
         content.body = body
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+}
+
+private extension VPNState {
+    var logName: String {
+        switch self {
+        case .connected: return "connected"
+        case .connecting: return "connecting"
+        case .disconnected: return "disconnected"
+        case .disconnecting: return "disconnecting"
+        }
     }
 }
 

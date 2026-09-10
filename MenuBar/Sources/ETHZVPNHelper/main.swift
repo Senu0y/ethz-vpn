@@ -2,7 +2,10 @@ import Foundation
 import Darwin
 import SystemConfiguration
 import Security
+import OSLog
 import VPNShared
+
+private let helperLog = Logger(subsystem: VPNService.helperID, category: "helper")
 
 // All state and process lifecycle operations run on this serial queue.
 final class VPNDaemon {
@@ -12,6 +15,7 @@ final class VPNDaemon {
     private var session: URL?
     private var stopping = false
     private var lastError: String?
+    private let routeRecord = URL(fileURLWithPath: "/private/var/run/ethz-vpn.route")
 
     private func authorize(_ uid: uid_t) throws {
         var consoleUID: uid_t = 0
@@ -74,6 +78,8 @@ final class VPNDaemon {
             throw VPNService.error("Invalid username, realm, password, or base32 OTP secret.")
         }
         let app = try trustedBundle()
+        helperLog.notice("Connection requested")
+        cleanupRecordedRoute(context: "before connection")
         let resources = app.appendingPathComponent("Contents/Resources")
         var template = Array("/private/var/run/ethz-vpn.XXXXXX".utf8CString)
         guard let directory = mkdtemp(&template) else { throw VPNService.error("Cannot create private VPN session directory.") }
@@ -89,7 +95,8 @@ final class VPNDaemon {
                                "--useragent=AnyConnect", "--passwd-on-stdin", "--config", config.path,
                                "--script", "'\(resources.path)/vpn-script'", "--no-external-auth", "sslvpn.ethz.ch"]
             child.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/var/root",
-                                 "LANG": "C", "ETHZ_VPN_SESSION_DIR": session.path]
+                                 "LANG": "C", "ETHZ_VPN_SESSION_DIR": session.path,
+                                 "ETHZ_VPN_ROUTE_RECORD": routeRecord.path]
             child.currentDirectoryURL = session
             let input = Pipe()
             child.standardInput = input
@@ -100,9 +107,18 @@ final class VPNDaemon {
                 self?.queue.async { [weak self] in
                     guard let self, self.process === child else { return }
                     if child.terminationStatus != 0 && !self.stopping {
-                        self.lastError = "OpenConnect exited with status \(child.terminationStatus). Check your credentials and network."
+                        let category = (try? String(contentsOf: session.appendingPathComponent("network-error"), encoding: .utf8))?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if category == "address-not-available" {
+                            self.lastError = "Network setup failed because macOS could not use the route to the VPN server. A stale host route may be responsible; retry the connection."
+                        } else {
+                            self.lastError = "OpenConnect exited with status \(child.terminationStatus). Check your credentials and network."
+                        }
+                        helperLog.error("OpenConnect exited unexpectedly; status=\(child.terminationStatus, privacy: .public), network_category=\(category ?? "none", privacy: .public)")
+                    } else {
+                        helperLog.notice("OpenConnect stopped; requested=\(self.stopping, privacy: .public), status=\(child.terminationStatus, privacy: .public)")
                     }
-                    self.cleanupRoute(session: session)
+                    self.cleanupRecordedRoute(context: "after connection")
                     try? FileManager.default.removeItem(at: session)
                     self.process = nil
                     self.session = nil
@@ -111,6 +127,7 @@ final class VPNDaemon {
                 }
             }
             try child.run()
+            helperLog.notice("OpenConnect started; pid=\(child.processIdentifier, privacy: .public)")
             self.process = child
             self.owner = uid
             self.session = session
@@ -119,6 +136,7 @@ final class VPNDaemon {
             input.fileHandleForWriting.write(Data((password + "\n").utf8))
             input.fileHandleForWriting.closeFile()
         } catch {
+            helperLog.error("Connection setup failed: \(error.localizedDescription, privacy: .public)")
             try? FileManager.default.removeItem(at: session)
             throw error
         }
@@ -127,6 +145,7 @@ final class VPNDaemon {
     func disconnect(uid: uid_t) throws {
         try authorize(uid)
         guard let child = process else { return }
+        helperLog.notice("Disconnect requested")
         stopping = true
         // Process owns this exact child; never search for or signal unrelated OpenConnect sessions.
         child.interrupt()
@@ -157,28 +176,62 @@ final class VPNDaemon {
         }
     }
 
-    private func cleanupRoute(session: URL) {
-        // The script records the exact server host route created for this session.
-        // Delete only if destination, gateway, and interface still match after exit.
-        guard let saved = try? String(contentsOf: session.appendingPathComponent("route"), encoding: .utf8),
-              let identity = RouteIdentity(output: saved) else { return }
+    private func cleanupRecordedRoute(context: String) {
+        // The network script stores only a route created by this app. Keep the record
+        // until exact-match deletion succeeds so a later attempt can recover after a
+        // helper interruption, DHCP renewal, or sleep/wake transition.
+        guard FileManager.default.fileExists(atPath: routeRecord.path) else {
+            helperLog.debug("No owned server route to clean up; context=\(context, privacy: .public)")
+            return
+        }
+        guard let saved = try? String(contentsOf: routeRecord, encoding: .utf8),
+              let identity = RouteIdentity(output: saved) else {
+            helperLog.error("Discarding invalid owned-route record; context=\(context, privacy: .public)")
+            try? FileManager.default.removeItem(at: routeRecord)
+            return
+        }
         let query = Process()
         query.executableURL = URL(fileURLWithPath: "/sbin/route")
         query.arguments = ["-n", "get", identity.destination]
         let output = Pipe()
         query.standardOutput = output
         query.standardError = FileHandle.nullDevice
-        guard (try? query.run()) != nil else { return }
+        guard (try? query.run()) != nil else {
+            helperLog.error("Could not inspect owned server route; context=\(context, privacy: .public)")
+            return
+        }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         query.waitUntilExit()
-        guard query.terminationStatus == 0,
-              RouteIdentity(output: String(decoding: data, as: UTF8.self)) == identity else { return }
+        guard query.terminationStatus == 0 else {
+            helperLog.error("Owned server route lookup failed; context=\(context, privacy: .public), status=\(query.terminationStatus, privacy: .public)")
+            return
+        }
+        guard let current = RouteIdentity(output: String(decoding: data, as: UTF8.self)) else {
+            helperLog.notice("Owned server host route is already absent; context=\(context, privacy: .public)")
+            try? FileManager.default.removeItem(at: routeRecord)
+            return
+        }
+        guard current == identity else {
+            helperLog.notice("Owned server route changed externally; leaving current route untouched; context=\(context, privacy: .public)")
+            try? FileManager.default.removeItem(at: routeRecord)
+            return
+        }
         let deletion = Process()
         deletion.executableURL = URL(fileURLWithPath: "/sbin/route")
         deletion.arguments = ["-n", "delete", "-host", identity.destination]
         deletion.standardOutput = FileHandle.nullDevice
         deletion.standardError = FileHandle.nullDevice
-        if (try? deletion.run()) != nil { deletion.waitUntilExit() }
+        guard (try? deletion.run()) != nil else {
+            helperLog.error("Could not start owned server route deletion; context=\(context, privacy: .public)")
+            return
+        }
+        deletion.waitUntilExit()
+        if deletion.terminationStatus == 0 {
+            helperLog.notice("Deleted owned server host route; context=\(context, privacy: .public)")
+            try? FileManager.default.removeItem(at: routeRecord)
+        } else {
+            helperLog.error("Owned server route deletion failed; context=\(context, privacy: .public), status=\(deletion.terminationStatus, privacy: .public)")
+        }
     }
 }
 
@@ -211,7 +264,11 @@ final class ClientSession: NSObject, VPNHelperProtocol {
 final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
     let daemon = VPNDaemon()
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-        guard connection.effectiveUserIdentifier != 0 else { return false }
+        guard connection.effectiveUserIdentifier != 0 else {
+            helperLog.error("Rejected root XPC client")
+            return false
+        }
+        helperLog.debug("Accepted XPC client")
         connection.exportedInterface = NSXPCInterface(with: VPNHelperProtocol.self)
         connection.exportedObject = ClientSession(daemon: daemon, uid: connection.effectiveUserIdentifier)
         connection.resume()
@@ -221,6 +278,7 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
 
 do {
     guard geteuid() == 0 else { throw VPNService.error("This helper must be started by macOS Service Management.") }
+    helperLog.notice("VPN helper starting")
     let team = try Signing.teamID()
     let listener = NSXPCListener(machServiceName: VPNService.helperID)
     listener.setConnectionCodeSigningRequirement(Signing.requirement(team: team, identifiers: [VPNService.appID, VPNService.cliID]))
@@ -229,6 +287,7 @@ do {
     listener.resume()
     withExtendedLifetime(delegate) { RunLoop.main.run() }
 } catch {
+    helperLog.fault("VPN helper startup failed: \(error.localizedDescription, privacy: .public)")
     fputs("\(error.localizedDescription)\n", stderr)
     exit(1)
 }
