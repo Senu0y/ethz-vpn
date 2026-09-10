@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+umask 077
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Do not claim a host route that existed before this session configured networking.
+if [ "$reason" = connect ]; then
+    if /sbin/route -n get "$VPNGATEWAY" > "$ETHZ_VPN_SESSION_DIR/route.before" 2>/dev/null; then
+        if ! /usr/bin/awk '/flags:/ && /[<,]HOST[,>]/ { found=1 } END { exit !found }' "$ETHZ_VPN_SESSION_DIR/route.before"; then
+            : > "$ETHZ_VPN_SESSION_DIR/owns-route"
+        fi
+    fi
+fi
+"$script_dir/vpnc-script"
+case "$reason" in
+    connect|reconnect)
+        /bin/rm -f "$ETHZ_VPN_SESSION_DIR/token.conf"
+        if [ -f "$ETHZ_VPN_SESSION_DIR/owns-route" ]; then
+            /sbin/route -n get "$VPNGATEWAY" > "$ETHZ_VPN_SESSION_DIR/route.tmp" 2>/dev/null || true
+            /bin/mv -f "$ETHZ_VPN_SESSION_DIR/route.tmp" "$ETHZ_VPN_SESSION_DIR/route"
+        fi
+        printf '%s\n' "${INTERNAL_IP4_ADDRESS:-${INTERNAL_IP6_ADDRESS:-}}" > "$ETHZ_VPN_SESSION_DIR/ip.tmp"
+        /bin/mv -f "$ETHZ_VPN_SESSION_DIR/ip.tmp" "$ETHZ_VPN_SESSION_DIR/ip"
+        ;;
+    disconnect|attempt-reconnect)
+        /bin/rm -f "$ETHZ_VPN_SESSION_DIR/ip"
+        ;;
+esac

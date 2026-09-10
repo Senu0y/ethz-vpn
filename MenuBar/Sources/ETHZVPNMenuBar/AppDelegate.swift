@@ -131,10 +131,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        if VPNController.shared.isOpenconnectRunning() {
-            VPNController.shared.disconnect()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard VPNController.shared.isOpenconnectRunning() else { return .terminateNow }
+        VPNController.shared.disconnect()
+        let deadline = Date().addingTimeInterval(14)
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
+            if !VPNController.shared.isOpenconnectRunning() {
+                timer.invalidate()
+                sender.reply(toApplicationShouldTerminate: true)
+            } else if Date() >= deadline {
+                timer.invalidate()
+                VPNController.shared.postNotification(body: "The VPN has not stopped yet. Wait for it to disconnect before quitting.")
+                sender.reply(toApplicationShouldTerminate: false)
+            } else {
+                VPNController.shared.disconnect()
+            }
         }
+        return .terminateLater
     }
 
     // MARK: - First-run
@@ -142,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func performFirstRunChecksIfNeeded() {
         let store = ProfileStore.shared
         guard store.hasAnyCompleteProfile,
-              SudoersHelper.isInstalled(openconnectPath: VPNController.shared.resolvedOpenconnectPath())
+              PrivilegedHelper.isEnabled
         else { openSetupWindow(); return }
     }
 
@@ -187,7 +200,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         connectMenuItem.isEnabled = !state.isConnected && !state.isTransitioning
         profilesConnectMenuItem.isEnabled = !state.isConnected && !state.isTransitioning
-        disconnectMenuItem.isHidden = !state.isConnected
+        disconnectMenuItem.isHidden = !state.isConnected && !state.isTransitioning
+        if case .disconnecting = state { disconnectMenuItem.isEnabled = false }
+        else { disconnectMenuItem.isEnabled = true }
     }
 
     private func setIcon(systemName: String) {

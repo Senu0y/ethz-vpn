@@ -11,6 +11,9 @@ struct ProfilesView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            VPNAccessView()
+            Divider()
+
             // Header
             VStack(spacing: 4) {
                 Image(systemName: "shield.fill")
@@ -239,7 +242,7 @@ struct ProfileEditFormView: View {
                 Spacer()
                 Button("Cancel") { onDone() }.keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    vm.save(openconnectPath: VPNController.shared.resolvedOpenconnectPath()) {
+                    vm.save {
                         onDone()
                     }
                 }
@@ -299,7 +302,7 @@ struct ProfileEditFormView: View {
         }
     }
 
-    func save(openconnectPath: String, completion: @escaping () -> Void) {
+    func save(completion: @escaping () -> Void) {
         let trimName     = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimOTP      = otpSecret.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -317,11 +320,7 @@ struct ProfileEditFormView: View {
         isSaving = true
         ProfileStore.shared.upsert(profile, password: password, token: trimOTP)
 
-        SudoersHelper.installIfNeeded(openconnectPath: openconnectPath) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.isSaving = false
-                completion()
-            }
-        }
+        isSaving = false
+        completion()
     }
 }

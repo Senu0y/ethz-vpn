@@ -24,11 +24,44 @@ jobs:
       - name: Bundle openconnect dylibs
         run: make fetch-openconnect
 
-      - name: Build and package
-        run: make dist
+      - name: Test
+        run: make test
+
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.SIGNING_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.SIGNING_KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$CERTIFICATE_P12" && test -n "$KEYCHAIN_PASSWORD" || { echo 'Configure the Developer ID signing secrets before releasing.'; exit 1; }
+          python3 -c 'import os,base64,pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "signing.p12").write_bytes(base64.b64decode(os.environ["CERTIFICATE_P12"]))'
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/signing.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/signing.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/signing.keychain-db"
+          security import "$RUNNER_TEMP/signing.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/signing.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/signing.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/signing.keychain-db"
+
+      - name: Sign and notarize
+        env:
+          SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          make dist SIGN_IDENTITY="$SIGN_IDENTITY"
+          xcrun notarytool submit 'dist/ETHZ VPN.zip' --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$TEAM_ID" --wait
+          xcrun stapler staple 'dist/ETHZ VPN.app'
+          ditto -c -k --keepParent 'dist/ETHZ VPN.app' 'dist/ETHZ VPN.zip'
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/ETHZ VPN.zip
           generate_release_notes: true
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/signing.p12"

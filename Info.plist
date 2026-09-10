@@ -24,7 +24,5 @@
     <string>NSApplication</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>ETHZ VPN needs to install a privilege helper so it can connect without a password prompt each time.</string>
 </dict>
 </plist>

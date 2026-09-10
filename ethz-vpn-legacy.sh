@@ -52,14 +52,14 @@ log_event() {
 
 print_usage() {
 	cat <<'EOF'
-ethz-vpn — ETH Zurich VPN client (uses the new privileged helper)
+ethz-vpn-legacy — ETH Zurich VPN helper (wraps openconnect with Keychain + profile support)
 
-Usage: ethz-vpn <command> [profile-name]
+Usage: ethz-vpn-legacy <command> [profile-name]
 
 Commands:
   connect [name]    Connect using a named profile (or the default profile)
   disconnect|d      Disconnect active ETHZ VPN session
-  status|s          Show the new helper’s VPN session status
+  status|s          Show whether openconnect is running
   profiles          List all saved profiles
   add               Add a new profile interactively
   edit <name>       Edit an existing profile
@@ -68,12 +68,12 @@ Commands:
   -h|--help         Show this help message
 
 Examples:
-  ethz-vpn connect
-  ethz-vpn connect staff
-  ethz-vpn disconnect
-  ethz-vpn profiles
-  ethz-vpn add
-  ethz-vpn default student
+  ethz-vpn-legacy connect
+  ethz-vpn-legacy connect staff
+  ethz-vpn-legacy disconnect
+  ethz-vpn-legacy profiles
+  ethz-vpn-legacy add
+  ethz-vpn-legacy default student
 EOF
 }
 
@@ -86,20 +86,12 @@ require_tool() {
 }
 
 ensure_prereqs() {
-    require_tool security
-}
-
-require_vpn_client() {
-    if [[ ! -x "/Applications/ETHZ VPN.app/Contents/MacOS/ETHZVPNCLI" ]]; then
-        error 'ethz-vpn requires the new signed app in /Applications with VPN Access enabled.'
-        error 'Use ethz-vpn-legacy for the existing VPN setup until installation is complete.'
-        return 1
-    fi
-}
-
-vpn_client() {
-    require_vpn_client || return 1
-    "/Applications/ETHZ VPN.app/Contents/MacOS/ETHZVPNCLI" "$@"
+	for tool in openconnect sudo security; do
+		require_tool "$tool"
+	done
+	if ! sudo -n true >/dev/null 2>&1; then
+		info 'Info: sudo password may be requested during VPN operations.'
+	fi
 }
 
 require_non_empty() {
@@ -245,7 +237,7 @@ for p in data:
 			active=$(profiles_list | head -1)
 		fi
 		if [[ -z "$active" ]]; then
-			error "Error: No profiles configured. Run \"ethz-vpn add\" first."
+			error "Error: No profiles configured. Run \"ethz-vpn-legacy add\" first."
 			return 1
 		fi
 		echo "$active"
@@ -256,10 +248,24 @@ for p in data:
 # VPN operations
 # ---------------------------------------------------------------------------
 
+openconnect_running() {
+	pgrep -x openconnect >/dev/null 2>&1
+}
+
+show_vpn_ip() {
+	local iface ip
+	for iface in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun'); do
+		ip=$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}')
+		if [[ -n "$ip" ]]; then
+			info "VPN IP ($iface): $ip"
+			return
+		fi
+	done
+}
+
 connect() {
 	local profile_name=${1:-}
 	ensure_prereqs
-	require_vpn_client || return 1
 
 	local id
 	id=$(resolve_profile_id "$profile_name") || return 1
@@ -271,7 +277,7 @@ connect() {
 	require_non_empty "Username" "$USERNAME"
 
 	if ! PASSWORD=$(keychain_get "eth-vpn-password-${id}"); then
-		error "Error: Could not read password for profile \"${id}\" from Keychain. Run \"ethz-vpn add\" or \"ethz-vpn edit ${id}\"."
+		error "Error: Could not read password for profile \"${id}\" from Keychain. Run \"ethz-vpn-legacy add\" or \"ethz-vpn-legacy edit ${id}\"."
 		return 1
 	fi
 	if ! TOKEN=$(keychain_get "eth-vpn-token-${id}"); then
@@ -282,6 +288,10 @@ connect() {
 	require_non_empty "Password" "$PASSWORD"
 	require_non_empty "Token" "$TOKEN"
 
+	if openconnect_running; then
+		error 'Error: openconnect already running. Use "ethz-vpn disconnect" first.'
+		return 1
+	fi
 
 	local display
 	display=$(profile_get_field "$id" "displayName")
@@ -289,16 +299,54 @@ connect() {
 	log_event "Connecting [${display}] ${USERNAME}@${REALM}.ethz.ch"
 	set_active_profile_id "$id"
 
-    printf '%s\n%s\n' "$PASSWORD" "$TOKEN" | vpn_client connect "$USERNAME" "$REALM"
-
+	if printf '%s\n' "$PASSWORD" | sudo openconnect -b -u "${USERNAME}@${REALM}.ethz.ch" -g "$REALM" \
+		--useragent=AnyConnect --passwd-on-stdin --token-mode=totp \
+		--token-secret="sha1:base32:${TOKEN}" --no-external-auth "$VPN_HOST"; then
+		success 'VPN connected successfully.'
+		log_event "VPN connected for [${display}] ${USERNAME}@${REALM}.ethz.ch"
+		notify "ETHZ VPN" "Connected as ${USERNAME}@${REALM}.ethz.ch (${display})"
+		show_vpn_ip
+	else
+		local status=$?
+		error "Error: openconnect exited with status ${status}."
+		log_event "VPN connection failed (${status}) for [${display}] ${USERNAME}@${REALM}.ethz.ch"
+		notify "ETHZ VPN" "Connection failed (status ${status})"
+		return $status
+	fi
 }
 
 disconnect() {
-    vpn_client disconnect
+	require_tool sudo
+	if openconnect_running; then
+		log_event "Disconnecting openconnect"
+		sudo pkill -SIGINT -x openconnect >/dev/null 2>&1 || true
+		local i=0
+		while openconnect_running && (( i < 10 )); do
+			sleep 0.5
+			(( i++ )) || true
+		done
+		if openconnect_running; then
+			warn 'Warning: openconnect still running after SIGINT.'
+			notify "ETHZ VPN" "Disconnect may have failed — process still running"
+		else
+			success 'VPN disconnected successfully.'
+			log_event "VPN disconnected successfully"
+			notify "ETHZ VPN" "Disconnected"
+		fi
+	else
+		info 'No openconnect process found.'
+		return 1
+	fi
 }
 
 status() {
-    vpn_client status
+	if openconnect_running; then
+		info 'openconnect is running (PIDs):'
+		pgrep -ax openconnect
+		show_vpn_ip
+	else
+		info 'VPN is currently disconnected.'
+	fi
 }
 
 # ---------------------------------------------------------------------------
@@ -309,7 +357,7 @@ cmd_profiles() {
 	local ids
 	ids=$(profiles_list)
 	if [[ -z "$ids" ]]; then
-		info "No profiles configured. Run \"ethz-vpn add\" to create one."
+		info "No profiles configured. Run \"ethz-vpn-legacy add\" to create one."
 		return
 	fi
 	local active
@@ -340,7 +388,7 @@ cmd_add() {
 	local id
 	id=$(echo "$display" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
 	if profile_exists "$id"; then
-		error "Error: A profile with id \"${id}\" already exists. Use \"ethz-vpn edit ${id}\" to update it."
+		error "Error: A profile with id \"${id}\" already exists. Use \"ethz-vpn-legacy edit ${id}\" to update it."
 		return 1
 	fi
 
@@ -376,7 +424,7 @@ cmd_add() {
 
 cmd_edit() {
 	local name=${1:-}
-	if [[ -z "$name" ]]; then error "Usage: ethz-vpn edit <profile-name>"; return 1; fi
+	if [[ -z "$name" ]]; then error "Usage: ethz-vpn-legacy edit <profile-name>"; return 1; fi
 
 	local id
 	id=$(resolve_profile_id "$name") || return 1
@@ -423,7 +471,7 @@ cmd_edit() {
 
 cmd_delete() {
 	local name=${1:-}
-	if [[ -z "$name" ]]; then error "Usage: ethz-vpn delete <profile-name>"; return 1; fi
+	if [[ -z "$name" ]]; then error "Usage: ethz-vpn-legacy delete <profile-name>"; return 1; fi
 
 	local id
 	id=$(resolve_profile_id "$name") || return 1
@@ -453,7 +501,7 @@ cmd_delete() {
 
 cmd_default() {
 	local name=${1:-}
-	if [[ -z "$name" ]]; then error "Usage: ethz-vpn default <profile-name>"; return 1; fi
+	if [[ -z "$name" ]]; then error "Usage: ethz-vpn-legacy default <profile-name>"; return 1; fi
 
 	local id
 	id=$(resolve_profile_id "$name") || return 1

@@ -15,3 +15,5 @@ dist/
 # Xcode
 *.xcuserdata/
 *.xcworkspace/xcuserdata/
+
+MenuBar/Sources/ETHZVPNMenuBar/Resources/vpnc-script
